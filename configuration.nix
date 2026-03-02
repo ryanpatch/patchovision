@@ -21,9 +21,11 @@
   boot.kernelParams = [
     "i915.force_probe=*"
     "consoleblank=0"
+    "processor.max_cstate=1"
+    "intel_idle.max_cstate=1"
     
    ];
-
+  powerManagement.cpuFreqGovernor = "performance";
   
   
   networking.hostName = "patchovision"; # Define your hostname.
