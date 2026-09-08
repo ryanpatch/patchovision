@@ -24,6 +24,12 @@ working reference, not as something to deploy as-is.
 
 ## How the remote works
 
+While a title plays, the page turns into transport controls: play/pause, seek,
+chapters, volume, elapsed and remaining, and pickers for the audio and subtitle
+tracks. Subtitles default to off; choosing one also switches `sub-visibility`
+on, so a track selection is not silently ignored when `mpv.conf` disables
+subtitles by default.
+
 Your phone does not get its own copy of the menu. It sends *keystrokes*, and
 the menu stays on the television where it already is. A small web server sits
 in the middle and routes each press by looking at which Unix socket is

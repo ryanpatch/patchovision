@@ -124,15 +124,70 @@ class MpvClient:
         result = self.batch([command])
         return result[0] if result else None
 
+    @staticmethod
+    def _track_id(value):
+        """mpv reports a disabled track as False, not a number.
+
+        bool is a subclass of int in Python, so False would otherwise sail
+        through an isinstance(..., int) check and read as track 0.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value
+
+    @staticmethod
+    def _describe_track(track: dict) -> dict:
+        """A phone-readable name for one track."""
+        name = []
+        lang = (track.get("lang") or "").strip()
+        title = (track.get("title") or "").strip()
+        if lang:
+            name.append(lang.upper() if len(lang) <= 3 else lang.title())
+        if title and title.lower() != lang.lower():
+            name.append(title)
+
+        detail = []
+        codec = (track.get("codec") or "").strip()
+        if codec:
+            detail.append(codec)
+        channels = track.get("demux-channel-count")
+        if channels:
+            detail.append(f"{channels}ch")
+        if track.get("external"):
+            detail.append("external")
+        if track.get("forced"):
+            detail.append("forced")
+
+        return {
+            "id": track.get("id"),
+            "label": " · ".join(name) or f"Track {track.get('id')}",
+            "detail": " · ".join(detail),
+        }
+
     def status(self) -> dict | None:
         props = [
             "media-title", "time-pos", "duration", "pause",
             "volume", "mute", "chapter", "chapters",
+            "track-list", "aid", "sid", "sub-visibility",
         ]
         results = self.batch([["get_property", p] for p in props])
         if results is None:
             return None
         data = dict(zip(props, results))
+
+        tracks = data.get("track-list") or []
+        audio = [self._describe_track(t) for t in tracks if t.get("type") == "audio"]
+        subs = [self._describe_track(t) for t in tracks if t.get("type") == "sub"]
+
+        # Subtitles count as off unless a track is selected AND rendering is on -
+        # mpv.conf may carry sub-visibility=no, in which case a chosen track
+        # still shows nothing.
+        sid = self._track_id(data.get("sid"))
+        sub_visible = data.get("sub-visibility")
+        sub_visible = True if sub_visible is None else bool(sub_visible)
+        if not sub_visible:
+            sid = None
+
         return {
             "ok": True,
             "mode": "playing",
@@ -144,6 +199,10 @@ class MpvClient:
             "muted": bool(data.get("mute")),
             "chapter": data.get("chapter"),
             "chapters": data.get("chapters") or 0,
+            "audio_tracks": audio,
+            "sub_tracks": subs,
+            "aid": self._track_id(data.get("aid")),
+            "sid": sid,
         }
 
 
@@ -280,7 +339,9 @@ PAGE = r"""<!doctype html>
   }
 
   /* ---------- playback ---------- */
-  #play{flex:1;display:flex;flex-direction:column;justify-content:center;gap:22px;padding:20px 18px}
+  #play{flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
+        display:flex;flex-direction:column;justify-content:flex-start;
+        gap:20px;padding:22px 18px 28px}
   #ptitle{font-size:19px;font-weight:600;text-align:center;line-height:1.3;
           display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
   #chap{text-align:center;font-size:13px;color:var(--dim);margin-top:-14px}
@@ -303,6 +364,41 @@ PAGE = r"""<!doctype html>
   #vol::-moz-range-track{height:5px;border-radius:3px;background:var(--panel2)}
   #vol::-moz-range-thumb{width:17px;height:17px;border:0;border-radius:50%;background:var(--text)}
   .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);margin-bottom:-14px}
+  .tracksec{background:var(--panel2);border:1px solid var(--line);border-radius:12px}
+  .tracksec > summary{
+    list-style:none;cursor:pointer;padding:13px 14px;
+    display:flex;align-items:center;gap:11px;touch-action:manipulation;user-select:none;
+  }
+  .tracksec > summary::-webkit-details-marker{display:none}
+  .tracksec > summary::after{
+    content:"\25BE";margin-left:auto;color:var(--dim);font-size:11px;flex:none;
+    transition:transform .15s;
+  }
+  .tracksec[open] > summary::after{transform:rotate(180deg)}
+  .tracksec > summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .seclbl{
+    font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);
+    flex:none;
+  }
+  .cur{
+    font-size:14px;color:var(--text);min-width:0;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .tracks{display:grid;gap:6px;padding:0 8px 8px;max-height:44vh;overflow-y:auto}
+  .track{
+    display:flex;align-items:center;gap:11px;
+    background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+    padding:11px 13px;cursor:pointer;touch-action:manipulation;user-select:none;
+    transition:background .08s;
+  }
+  .track:active{background:var(--accent)}
+  .track.on{background:var(--accent-dim);border-color:var(--accent)}
+  .track .mark{width:15px;flex:none;color:var(--accent);font-size:13px;text-align:center}
+  .track .txt{flex:1;min-width:0}
+  .track .nm{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .track.on .nm{font-weight:600}
+  .track .dt{display:block;font-size:11px;color:var(--dim);margin-top:2px;
+             white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
   /* ---------- idle ---------- */
   #idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -369,6 +465,14 @@ PAGE = r"""<!doctype html>
       <div class="lbl">Volume</div>
       <input id="vol" type="range" min="0" max="100" value="100">
     </div>
+    <details id="audiosec" class="tracksec hidden">
+      <summary><span class="seclbl">Audio</span><span id="audiocur" class="cur"></span></summary>
+      <div id="audiolist" class="tracks"></div>
+    </details>
+    <details id="subsec" class="tracksec hidden">
+      <summary><span class="seclbl">Subs</span><span id="subcur" class="cur"></span></summary>
+      <div id="sublist" class="tracks"></div>
+    </details>
     <div class="rowgrid g2">
       <div class="btn sm" data-mpv='["script-binding","stats/display-stats-toggle"]'>&#9432; Info</div>
       <div class="btn sm" data-mpv='["quit"]'>&#9632; Stop</div>
@@ -429,6 +533,19 @@ function render(state){
       (state.chapters > 0 && state.chapter !== null && state.chapter !== undefined)
         ? "Chapter " + (state.chapter + 1) + " of " + state.chapters : "";
     if (!volTouching) $("vol").value = Math.round(state.volume == null ? 100 : state.volume);
+
+    // Audio: only worth showing when there is a choice to make.
+    renderTracks("audiolist", "audiosec", "audiocur",
+                 state.audio_tracks || [], state.aid, false,
+                 (id) => [["set_property", "aid", id]]);
+
+    // Subtitles: always offer Off, and selecting a track has to switch
+    // rendering on as well - mpv.conf can carry sub-visibility=no.
+    renderTracks("sublist", "subsec", "subcur",
+                 state.sub_tracks || [], state.sid, true,
+                 (id) => id === "no"
+                   ? [["set_property", "sid", "no"], ["set_property", "sub-visibility", "no"]]
+                   : [["set_property", "sid", id], ["set_property", "sub-visibility", "yes"]]);
     return;
   }
 
@@ -469,6 +586,63 @@ function render(state){
   if (mode !== "idle"){ show("idle"); mode = "idle"; lastSig = ""; }
   $("hdr").textContent = "Idle";
   $("hdrsub").textContent = "";
+}
+
+// --- track lists ---------------------------------------------------------
+function renderTracks(listId, sectionId, currentId_el, tracks, currentId, includeOff, commandsFor){
+  const section = $(sectionId), list = $(listId), summary = $(currentId_el);
+
+  // Audio with a single track is not a choice; subtitles always have Off.
+  if (!tracks.length || (!includeOff && tracks.length < 2)){
+    section.classList.add("hidden");
+    list.dataset.sig = "";
+    return;
+  }
+
+  const rows = [];
+  if (includeOff) rows.push({id:"no", label:"Off", detail:"", on: currentId === null});
+  for (const t of tracks) rows.push({id:t.id, label:t.label, detail:t.detail, on:t.id === currentId});
+
+  const chosen = rows.find(r => r.on);
+  summary.textContent = chosen ? chosen.label : "\u2014";
+
+  // Rebuild only on a real change, so a tap does not fight the next poll.
+  const signature = rows.map(r => r.id + (r.on ? "*" : "") + r.label).join("|");
+  if (list.dataset.sig === signature){ section.classList.remove("hidden"); return; }
+  list.dataset.sig = signature;
+
+  list.innerHTML = "";
+  for (const row of rows){
+    const el = document.createElement("div");
+    el.className = "track" + (row.on ? " on" : "");
+
+    const mark = document.createElement("span");
+    mark.className = "mark";
+    mark.textContent = row.on ? "\u2713" : "";
+
+    const text = document.createElement("span");
+    text.className = "txt";
+    const name = document.createElement("span");
+    name.className = "nm";
+    name.textContent = row.label;          // track titles come from the file
+    text.appendChild(name);
+    if (row.detail){
+      const detail = document.createElement("span");
+      detail.className = "dt";
+      detail.textContent = row.detail;
+      text.appendChild(detail);
+    }
+
+    el.appendChild(mark);
+    el.appendChild(text);
+    el.addEventListener("click", () => {
+      if (navigator.vibrate) navigator.vibrate(8);
+      section.open = false;          // choice made, fold it away again
+      send("/api/mpv", {commands: commandsFor(row.id)});
+    });
+    list.appendChild(el);
+  }
+  section.classList.remove("hidden");
 }
 
 // --- buttons -------------------------------------------------------------
@@ -627,6 +801,19 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/mpv":
+            # "commands" applies several in order - selecting a subtitle has to
+            # set both the track and sub-visibility, and doing it in one request
+            # avoids the page rendering a half-applied state in between.
+            commands = body.get("commands")
+            if isinstance(commands, list) and commands:
+                if not all(isinstance(c, list) for c in commands):
+                    self._json({"ok": False, "error": "bad commands"})
+                    return
+                mpv.batch(commands)
+                time.sleep(0.12)
+                self._json(current_status())
+                return
+
             command = body.get("command")
             if not isinstance(command, list):
                 self._json({"ok": False, "error": "bad command"})
