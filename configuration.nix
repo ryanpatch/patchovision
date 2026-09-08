@@ -68,6 +68,7 @@
   users.users.ryan = {
     isNormalUser = true;
     description = "ryan";
+    openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJcH+yxVKs7k7xMsH6FdE9qFXCXjv8qk6hcWRh5jfhNe claude-code@ryans-mac" ];
     extraGroups = [ "networkmanager" "wheel" "video" "audio" "render" "seat" "input" ];
     packages = with pkgs; [];
   };
