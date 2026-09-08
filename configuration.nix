@@ -126,7 +126,39 @@
     wireplumber.enable = true;
     alsa.enable = true;
     pulse.enable = true;
+
+    # HDMI out to the AV receiver. Intel's DMA position reporting is imprecise,
+    # so give the ALSA sink extra headroom; and stop the node suspending when
+    # idle, since the receiver re-syncs on resume and that is audible.
+    wireplumber.extraConfig."52-hdmi-headroom" = {
+      "monitor.alsa.rules" = [
+        {
+          matches = [ { "node.name" = "~alsa_output.*hdmi.*"; } ];
+          actions.update-props = {
+            "api.alsa.headroom" = 1024;
+            "session.suspend-timeout-seconds" = 0;
+          };
+        }
+      ];
+    };
+
+    # Fewer, fatter wakeups. Latency is irrelevant here; raising min-quantum is
+    # what stops a client dragging the whole graph down to 32 frames.
+    extraConfig.pipewire."92-htpc-quantum" = {
+      "context.properties" = {
+        "default.clock.rate" = 48000;
+        "default.clock.quantum" = 2048;
+        "default.clock.min-quantum" = 1024;
+        "default.clock.max-quantum" = 4096;
+      };
+    };
   };
+  # Stop the HDA codec powering down after 10s of silence. On HDMI that drops
+  # the audio link and the AV receiver has to re-acquire it, which is audible.
+  boot.extraModprobeConfig = ''
+    options snd_hda_intel power_save=0 power_save_controller=N
+  '';
+
   security.rtkit.enable = true;
   security.polkit.enable = true;
 
