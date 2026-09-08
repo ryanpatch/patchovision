@@ -67,7 +67,11 @@ out of mpv's own `path` — the stream URL the selector built — so nothing ext
 has to be plumbed between them.
 
 It posts `Playing` on start, `Progress` every ten seconds and on any pause
-change, and `Stopped` with the final position. A Jellyfin that is down or
+change, and `Stopped` with the final position.
+
+Picking a title that has a stored position asks before playing — *Resume from
+1:23:45* or *Start from the beginning* — rather than deciding for you. Under
+thirty seconds in, or within thirty seconds of the end, it just plays. A Jellyfin that is down or
 unreachable is logged once and retried, and never affects the remote itself.
 
 Set `JVUEY_REPORT=0` in the service environment to turn it off.

@@ -544,6 +544,21 @@ def format_runtime(ticks: int | None) -> str:
     return f"{minutes}m"
 
 
+# Below this, resuming is not worth offering - you have barely started.
+# Jellyfin discards positions under its own MinResumePct anyway.
+RESUME_MIN_SECONDS = 30
+
+
+def format_clock(seconds: float) -> str:
+    """Seconds as H:MM:SS, or M:SS under an hour."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
 def format_item_display(item: dict) -> tuple[str, str]:
     """
     Format an item for display in the list view.
@@ -874,6 +889,7 @@ class JellyfinSelector(App):
         self.target_peak = output["target_peak"]
         self.gamut_mapping = output["gamut_mapping"]
         self.output_editing = None      # which knob a choice list is editing
+        self.pending_playback = None    # payload held while asking about resume
         
         # Settings state (cached)
         self.drm_connectors = {}
@@ -1918,6 +1934,8 @@ class JellyfinSelector(App):
             self._select_output_choice(item.get("key", ""), item.get("value", ""))
         elif item_type == "OutputReset":
             self._reset_output_defaults()
+        elif item_type == "ResumeChoice":
+            self._resume_choice(float(item.get("start", 0.0)))
         elif item_type == "Connector":
             self._navigate_to_modes(item)
         elif item_type == "Mode":
@@ -2184,7 +2202,92 @@ class JellyfinSelector(App):
         """Play a movie or episode"""
         item_id = item["Id"]
         stream_url = f"{self.server_url}/Items/{item_id}/Download?api_key={self.api_key}"
-        self.exit((stream_url, self.drm_connector, self.drm_mode, self.audio_device, self.audio_spdif))
+        self._begin_playback(item, {
+            "url": stream_url,
+            "drm_connector": self.drm_connector,
+            "drm_mode": self.drm_mode,
+            "audio_device": self.audio_device,
+            "audio_spdif": self.audio_spdif,
+            "track_args": [],
+        })
+    
+    # ---- resume ---------------------------------------------------------
+    
+    def _resume_position(self, item: dict) -> float:
+        """Where Jellyfin thinks this title got to, in seconds.
+        
+        Re-fetched rather than trusted from the list, so a position set from
+        the phone or the web client since the list loaded still counts.
+        """
+        user_data = item.get("UserData") or {}
+        try:
+            fresh = self._fetch_item(item.get("Id", ""))
+            if fresh:
+                user_data = fresh.get("UserData") or user_data
+        except Exception:
+            pass
+        return (user_data.get("PlaybackPositionTicks") or 0) / 10_000_000
+    
+    def _begin_playback(self, item: dict, payload: dict) -> None:
+        """Play now, or ask first if there is somewhere to resume from."""
+        payload.setdefault("start", 0.0)
+        
+        seconds = self._resume_position(item)
+        runtime = (item.get("RunTimeTicks") or 0) / 10_000_000
+        near_end = bool(runtime) and seconds > runtime - RESUME_MIN_SECONDS
+        
+        if seconds >= RESUME_MIN_SECONDS and not near_end:
+            self.pending_playback = payload
+            self._navigate_to_resume(item, seconds)
+        else:
+            self.exit(payload)
+    
+    def _navigate_to_resume(self, item: dict, seconds: float) -> None:
+        self.navigation_stack.append({
+            "view": self.current_view,
+            "series_id": self.current_series_id,
+            "series_name": self.current_series_name,
+            "collection_id": self.current_collection_id,
+            "collection_name": self.current_collection_name,
+            "title": self.title,
+        })
+        self.current_view = "resume"
+        self.title = item.get("Name", "Resume")
+        self._populate_resume(item, seconds)
+        self.sub_title = "Resume or start over"
+        self.list_view.focus()
+    
+    def _populate_resume(self, item: dict, seconds: float) -> None:
+        self.list_view.clear()
+        chars = _get_chars()
+        
+        runtime = (item.get("RunTimeTicks") or 0) / 10_000_000
+        remaining = f"{format_clock(runtime - seconds)} left" if runtime > seconds else ""
+        
+        resume = ListItem(Horizontal(
+            Label(f"{chars['play']} Resume from {format_clock(seconds)}", classes="item-title"),
+            Label(remaining, classes="item-runtime"),
+        ))
+        resume.item_data = {"Type": "ResumeChoice", "start": seconds}
+        self.list_view.append(resume)
+        
+        restart = ListItem(Horizontal(
+            Label(f"{chars['unwatched']} Start from the beginning", classes="item-title"),
+            Label(format_clock(runtime) if runtime else "", classes="item-runtime"),
+        ))
+        restart.item_data = {"Type": "ResumeChoice", "start": 0.0}
+        self.list_view.append(restart)
+        
+        if len(self.list_view) > 0:
+            self.call_after_refresh(self._select_first_item)
+    
+    def _resume_choice(self, start: float) -> None:
+        payload = self.pending_playback
+        if not payload:
+            return
+        payload["start"] = start
+        self.pending_playback = None
+        self.exit(payload)
     
     def _play_with_tracks(self) -> None:
         """Play with selected tracks"""
@@ -2209,7 +2312,14 @@ class JellyfinSelector(App):
         else:
             track_args.append("--sid=no")
         
-        self.exit((stream_url, drm_connector, drm_mode, audio_device, self.audio_spdif, track_args))
+        self._begin_playback(self.detail_item, {
+            "url": stream_url,
+            "drm_connector": drm_connector,
+            "drm_mode": drm_mode,
+            "audio_device": audio_device,
+            "audio_spdif": self.audio_spdif,
+            "track_args": track_args,
+        })
     
     # ========================================================================
     # Actions (Key Bindings)
@@ -2886,12 +2996,16 @@ def main():
             continue
 
         if result:
-            # Playback - unpack and exec mpv
-            if len(result) == 6:
-                stream_url, drm_connector, drm_mode, audio_device, audio_spdif, track_args = result
-            else:
-                stream_url, drm_connector, drm_mode, audio_device, audio_spdif = result
-                track_args = []
+            # Playback - unpack and exec mpv. A dict rather than a tuple so
+            # optional pieces (track selection, a resume position) can be added
+            # without every call site having to agree on a length.
+            stream_url = result["url"]
+            drm_connector = result.get("drm_connector") or ""
+            drm_mode = result.get("drm_mode") or ""
+            audio_device = result.get("audio_device") or ""
+            audio_spdif = result.get("audio_spdif") or ""
+            track_args = result.get("track_args") or []
+            start_at = result.get("start") or 0
 
             # Build MPV command
             mpv_args = ["mpv"]
@@ -2903,6 +3017,8 @@ def main():
                 mpv_args.append(f"--audio-device={audio_device}")
             if audio_spdif:
                 mpv_args.append(f"--audio-spdif={audio_spdif}")
+            if start_at:
+                mpv_args.append(f"--start={int(start_at)}")
             mpv_args.extend(track_args)
             # Video output (SDR / HDR and the SDR tone-mapping knobs). Read
             # fresh from the config so a change in the settings screen applies
