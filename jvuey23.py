@@ -89,6 +89,107 @@ def _get_chars() -> dict:
         _CONFIG["chars"] = CHARS_ASCII if _CONFIG["tty_mode"] else CHARS_UNICODE
     return _CONFIG["chars"]
 
+# ============================================================================
+# Video output
+#
+# These are passed on the mpv command line, which beats mpv.conf, so switching
+# here works whatever profiles the user has defined in their own config.
+# ============================================================================
+
+# What each output mode pins. SDR target-peak is overridden by the user's
+# setting; the HDR values are passthrough and not meant to be tweaked.
+OUTPUT_PROFILES = {
+    "sdr": {
+        "target-trc": "bt.1886",
+        "target-prim": "bt.709",
+        "target-gamut": "bt.709",
+        "target-peak": "203",
+    },
+    "hdr": {
+        "target-trc": "pq",
+        "target-prim": "bt.2020",
+        "target-gamut": "bt.2020",
+        "target-peak": "1000",
+    },
+}
+
+# The settings this box was tuned to, restored by "Reset to Vlad's Default".
+VLAD_DEFAULTS = {
+    "output_mode": "sdr",
+    "tone_mapping": "spline",
+    "target_peak": "203",
+    "gamut_mapping": "",
+}
+
+TONE_MAPPING_CHOICES = [
+    ("spline", "Balanced, and what this box was tuned with"),
+    ("bt.2390", "The broadcast standard curve"),
+    ("hable", "Filmic - lifts shadows, softer highlights"),
+    ("reinhard", "Simple - flatter, less contrast"),
+    ("clip", "None - hard clips anything too bright"),
+    ("auto", "Let mpv decide per source"),
+]
+
+TARGET_PEAK_CHOICES = [
+    ("203", "SDR reference white - the standard"),
+    ("120", "Dim room, or an older panel"),
+    ("300", "Bright room"),
+    ("400", "Very bright panel"),
+    ("600", "HDR-capable panel driven in SDR"),
+]
+
+GAMUT_MAPPING_CHOICES = [
+    ("", "Auto - let mpv decide"),
+    ("perceptual", "Compress smoothly into the display gamut"),
+    ("relative", "Keep in-gamut colours exact"),
+    ("clip", "Hard clip anything out of gamut"),
+    ("desaturate", "Fade out-of-gamut colours toward white"),
+]
+
+OUTPUT_CHOICES = {
+    "tone_mapping": ("Tone mapping", TONE_MAPPING_CHOICES),
+    "target_peak": ("Target peak", TARGET_PEAK_CHOICES),
+    "gamut_mapping": ("Gamut mapping", GAMUT_MAPPING_CHOICES),
+}
+
+
+def load_output_settings() -> dict:
+    """Read the video-output settings, falling back to this box's defaults."""
+    config = load_config()
+    section = config["mpv"] if "mpv" in config else {}
+    settings = dict(VLAD_DEFAULTS)
+    for key in settings:
+        if key in section:
+            settings[key] = section[key]
+    if settings["output_mode"] not in OUTPUT_PROFILES:
+        settings["output_mode"] = VLAD_DEFAULTS["output_mode"]
+    return settings
+
+
+def build_output_args(settings: dict) -> list[str]:
+    """Turn saved output settings into mpv command-line arguments."""
+    mode = settings.get("output_mode", "sdr")
+    profile = dict(OUTPUT_PROFILES.get(mode, OUTPUT_PROFILES["sdr"]))
+
+    args = []
+    if mode == "sdr":
+        # Only SDR exposes the tone-mapping knobs - in HDR the display does
+        # the mapping, so overriding here would fight it.
+        peak = str(settings.get("target_peak") or profile["target-peak"]).strip()
+        if peak:
+            profile["target-peak"] = peak
+        tone = (settings.get("tone_mapping") or "").strip()
+        if tone:
+            args.append(f"--tone-mapping={tone}")
+        gamut = (settings.get("gamut_mapping") or "").strip()
+        if gamut:
+            args.append(f"--gamut-mapping-mode={gamut}")
+
+    for option, value in profile.items():
+        args.append(f"--{option}={value}")
+    return args
+
+
 # Character sets for different display modes
 CHARS_UNICODE = {
     "tv": "📺",
@@ -766,6 +867,14 @@ class JellyfinSelector(App):
         self.current_collection_id = None
         self.current_collection_name = None
         
+        # Video output settings, loaded from the same config file
+        output = load_output_settings()
+        self.output_mode = output["output_mode"]
+        self.tone_mapping = output["tone_mapping"]
+        self.target_peak = output["target_peak"]
+        self.gamut_mapping = output["gamut_mapping"]
+        self.output_editing = None      # which knob a choice list is editing
+        
         # Settings state (cached)
         self.drm_connectors = {}
         self.audio_devices = []
@@ -1203,6 +1312,15 @@ class JellyfinSelector(App):
         drm_item.item_data = {"Type": "SettingsMenu", "menu": "drm"}
         self.list_view.append(drm_item)
         
+        # Video output (SDR / HDR)
+        if self.output_mode == "hdr":
+            output_status = "HDR passthrough"
+        else:
+            output_status = f"SDR, {self.tone_mapping or 'auto'} @ {self.target_peak} nits"
+        output_item = ListItem(Label(f"{chars['display']} Video Output: {output_status}"))
+        output_item.item_data = {"Type": "SettingsMenu", "menu": "output"}
+        self.list_view.append(output_item)
+        
         # Audio Device
         audio_status = self.audio_device if self.audio_device else "auto"
         audio_item = ListItem(Label(f"{chars['audio']} Audio Device: {audio_status}"))
@@ -1214,6 +1332,101 @@ class JellyfinSelector(App):
         spdif_item = ListItem(Label(f"{chars['audio']} Audio Passthrough: {spdif_status}"))
         spdif_item.item_data = {"Type": "SettingsMenu", "menu": "spdif"}
         self.list_view.append(spdif_item)
+    
+    def _populate_output_settings(self) -> None:
+        """SDR / HDR, and the tone-mapping knobs that only apply to SDR."""
+        self.list_view.clear()
+        chars = _get_chars()
+        
+        for mode, label in (("sdr", "SDR"), ("hdr", "HDR passthrough")):
+            marker = chars["selected"] if self.output_mode == mode else chars["unselected"]
+            item = ListItem(Label(f"{marker} {label}"))
+            item.item_data = {"Type": "OutputMode", "mode": mode}
+            self.list_view.append(item)
+        
+        separator = ListItem(Label(chars["separator"]))
+        separator.item_data = {"Type": "Separator"}
+        self.list_view.append(separator)
+        
+        if self.output_mode == "sdr":
+            for key in ("tone_mapping", "target_peak", "gamut_mapping"):
+                title, choices = OUTPUT_CHOICES[key]
+                current = getattr(self, key)
+                shown = dict(choices).get(current)
+                name = current or "auto"
+                suffix = " nits" if key == "target_peak" else ""
+                item = ListItem(Label(f"  {title}: {name}{suffix}"))
+                item.item_data = {"Type": "OutputSetting", "key": key}
+                self.list_view.append(item)
+        else:
+            note = ListItem(Label("  Tone mapping is handled by the display in HDR"))
+            note.item_data = {"Type": "Separator"}
+            self.list_view.append(note)
+        
+        separator2 = ListItem(Label(chars["separator"]))
+        separator2.item_data = {"Type": "Separator"}
+        self.list_view.append(separator2)
+        
+        reset = ListItem(Label(f"{chars['clear']} Reset to Vlad's Default"))
+        reset.item_data = {"Type": "OutputReset"}
+        self.list_view.append(reset)
+        
+        # Open with something highlighted, so arrow keys and the phone remote
+        # both have a cursor to move from.
+        if len(self.list_view) > 0:
+            self.call_after_refresh(self._select_first_item)
+    
+    def _populate_output_choices(self) -> None:
+        """The values for whichever knob is being edited."""
+        self.list_view.clear()
+        chars = _get_chars()
+        key = self.output_editing
+        if key not in OUTPUT_CHOICES:
+            return
+        
+        _, choices = OUTPUT_CHOICES[key]
+        current = getattr(self, key)
+        default = VLAD_DEFAULTS[key]
+        
+        # One row per choice. A description on its own row would read nicely but
+        # would double the number of arrow presses to cross the list, on both
+        # the keyboard and the phone remote.
+        for value, description in choices:
+            marker = chars["selected"] if value == current else chars["unselected"]
+            name = value or "auto"
+            if key == "target_peak":
+                name = f"{name} nits"
+            tag = " (Vlad's default)" if value == default else ""
+            item = ListItem(Horizontal(
+                Label(f"{marker} {name}{tag}", classes="item-title"),
+                Label(description, classes="item-runtime"),
+            ))
+            item.item_data = {"Type": "OutputChoice", "key": key, "value": value}
+            self.list_view.append(item)
+        
+        # Open with something highlighted, so arrow keys and the phone remote
+        # both have a cursor to move from.
+        if len(self.list_view) > 0:
+            self.call_after_refresh(self._select_first_item)
+    
+    def _select_output_mode(self, mode: str) -> None:
+        self.output_mode = mode
+        self._save_settings()
+        self._populate_output_settings()
+        self.sub_title = f"Output set to {mode.upper()}"
+    
+    def _select_output_choice(self, key: str, value: str) -> None:
+        if key in OUTPUT_CHOICES:
+            setattr(self, key, value)
+            self._save_settings()
+        self.action_back()
+    
+    def _reset_output_defaults(self) -> None:
+        for key, value in VLAD_DEFAULTS.items():
+            setattr(self, key, value)
+        self._save_settings()
+        self._populate_output_settings()
+        self.sub_title = "Restored Vlad's default output settings"
     
     def _populate_drm_settings(self) -> None:
         """Populate DRM settings options"""
@@ -1693,8 +1906,18 @@ class JellyfinSelector(App):
             self._navigate_to_episodes(item)
         elif item_type in ("Episode", "Movie"):
             self._play_item(item)
+        elif item_type == "Separator":
+            return
         elif item_type == "SettingsMenu":
             self._navigate_to_settings_submenu(item)
+        elif item_type == "OutputMode":
+            self._select_output_mode(item.get("mode", "sdr"))
+        elif item_type == "OutputSetting":
+            self._navigate_to_output_choices(item.get("key", ""))
+        elif item_type == "OutputChoice":
+            self._select_output_choice(item.get("key", ""), item.get("value", ""))
+        elif item_type == "OutputReset":
+            self._reset_output_defaults()
         elif item_type == "Connector":
             self._navigate_to_modes(item)
         elif item_type == "Mode":
@@ -1834,7 +2057,25 @@ class JellyfinSelector(App):
             self.title = "Settings - Audio Passthrough"
             self._populate_spdif_settings()
             self.sub_title = "Toggle passthrough codecs"
+        elif menu == "output":
+            self.current_view = "settings_output"
+            self.title = "Settings - Video Output"
+            self._populate_output_settings()
+            self.sub_title = "SDR or HDR, and how SDR is mapped"
         
+        self.list_view.focus()
+    
+    def _navigate_to_output_choices(self, key: str) -> None:
+        """Open the value list for one output knob"""
+        if key not in OUTPUT_CHOICES:
+            return
+        self.navigation_stack.append({"view": "settings_output",
+                                      "title": "Settings - Video Output"})
+        self.output_editing = key
+        self.current_view = "settings_output_choice"
+        self.title = f"Settings - {OUTPUT_CHOICES[key][0]}"
+        self._populate_output_choices()
+        self.sub_title = "Select a value"
         self.list_view.focus()
     
     def _navigate_to_modes(self, connector: dict) -> None:
@@ -1928,6 +2169,10 @@ class JellyfinSelector(App):
         config["mpv"]["drm_mode"] = self.drm_mode
         config["mpv"]["audio_device"] = self.audio_device
         config["mpv"]["audio_spdif"] = self.audio_spdif
+        config["mpv"]["output_mode"] = self.output_mode
+        config["mpv"]["tone_mapping"] = self.tone_mapping
+        config["mpv"]["target_peak"] = self.target_peak
+        config["mpv"]["gamut_mapping"] = self.gamut_mapping
         
         save_config(config)
     
@@ -2057,6 +2302,9 @@ class JellyfinSelector(App):
         elif self.current_view == "settings_spdif":
             self._populate_spdif_settings()
             self.sub_title = "Toggle passthrough codecs"
+        elif self.current_view == "settings_output":
+            self._populate_output_settings()
+            self.sub_title = "SDR or HDR, and how SDR is mapped"
         
         self.list_view.focus()
     
@@ -2204,7 +2452,9 @@ class JellyfinSelector(App):
         if self.current_view == "details":
             # In detail view, play with selected tracks
             self._play_with_tracks()
-        elif self.current_view not in ("settings", "settings_drm", "settings_drm_modes", "settings_audio", "settings_spdif", "servers"):
+        elif self.current_view not in ("settings", "settings_drm", "settings_drm_modes",
+                                       "settings_audio", "settings_spdif",
+                                       "settings_output", "settings_output_choice", "servers"):
             # In library/season/episode view, play highlighted item directly
             if not self.list_view or self.list_view.index is None:
                 return
@@ -2654,6 +2904,10 @@ def main():
             if audio_spdif:
                 mpv_args.append(f"--audio-spdif={audio_spdif}")
             mpv_args.extend(track_args)
+            # Video output (SDR / HDR and the SDR tone-mapping knobs). Read
+            # fresh from the config so a change in the settings screen applies
+            # to the very next title without restarting anything.
+            mpv_args.extend(build_output_args(load_output_settings()))
             # Control channel for the phone remote. This does not affect
             # decoding, output or timing - mpv just listens on a socket.
             mpv_args.append(f"--input-ipc-server={MPV_SOCKET}")

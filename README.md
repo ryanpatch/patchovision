@@ -139,6 +139,29 @@ a file in `/etc/sysctl.d/` will not survive a rebuild:
 boot.kernel.sysctl."net.ipv4.ip_unprivileged_port_start" = 80;
 ```
 
+## Video output
+
+Settings (`s`) has a **Video Output** screen that switches between SDR and HDR
+and, in SDR only, exposes three knobs worth changing on a different display:
+
+| | |
+|---|---|
+| Tone mapping | the curve — spline, bt.2390, hable, reinhard, clip, auto |
+| Target peak | display brightness in nits — 120 to 600, 203 is SDR reference |
+| Gamut mapping | what happens to colours the display cannot show |
+
+HDR is deliberately dumb passthrough: it pins `target-trc=pq`,
+`target-prim=bt.2020`, `target-gamut=bt.2020` and `target-peak=1000`, and
+exposes nothing else. The display is doing the mapping there, so overriding
+from this end would only fight it.
+
+**Reset to Vlad's Default** restores the settings this box was tuned with —
+SDR, spline, 203 nits, automatic gamut mapping.
+
+These go on the mpv command line, which beats `mpv.conf`, so the screen works
+whatever profiles you have defined in your own player config, and nothing here
+edits that file.
+
 ## Configuration
 
 `~/.config/jvuey/config.ini`, written by the selector and kept at mode 600

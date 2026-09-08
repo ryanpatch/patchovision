@@ -976,6 +976,11 @@ class Handler(BaseHTTPRequestHandler):
             # Jump the highlight to a row the phone tapped, by stepping the
             # TUI's own cursor so its scrolling stays consistent.
             status = tui.request({"action": "status"})
+            # Settings screens open with no row highlighted. Nudge once to
+            # establish a cursor, otherwise there is no index to walk from and
+            # the jump silently does nothing.
+            if status and status.get("index") is None:
+                status = tui.request({"action": "key", "key": "down"})
             if status and status.get("index") is not None:
                 delta = int(body.get("index", 0)) - int(status["index"])
                 key = "down" if delta > 0 else "up"
