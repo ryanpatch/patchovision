@@ -21,10 +21,17 @@ Jellyfin credentials or stream URLs are ever sent to the phone.
 """
 
 import os
+import re
 import sys
 import json
 import time
+import uuid
 import socket
+import threading
+import configparser
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -261,6 +268,183 @@ def current_status() -> dict:
     if status:
         return status
     return {"ok": True, "mode": "idle"}
+
+
+# ============================================================================
+# Telling Jellyfin where playback got to
+#
+# The selector execs mpv and exits, so it cannot report anything itself - by
+# the time a title is playing there is no Python left in that process. This
+# daemon is the only thing alive for the whole of playback, and it already
+# polls mpv for the phone, so it does the reporting too.
+#
+# Nothing new has to be plumbed through: the Jellyfin item id is already in
+# mpv's own `path`, which is the stream URL the selector built.
+# ============================================================================
+
+TICKS_PER_SECOND = 10_000_000          # Jellyfin counts in 100-nanosecond ticks
+REPORT_EVERY = 10.0                    # seconds between progress posts
+POLL_EVERY = 2.0                       # seconds between mpv checks
+
+CONFIG_PATHS = [
+    Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "jvuey" / "config.ini",
+    Path.home() / ".jvuey.ini",
+]
+
+# The selector builds stream URLs as /Items/<id>/Download.
+ITEM_ID_PATTERN = re.compile(r"/(?:Items|Videos)/([0-9a-fA-F-]{8,})/(?:Download|stream)")
+
+
+def _load_server() -> dict | None:
+    """Current server details from the same config file the selector uses."""
+    config = configparser.ConfigParser()
+    for path in CONFIG_PATHS:
+        if path.exists():
+            config.read(path)
+            break
+    else:
+        return None
+    try:
+        name = config["general"]["active_server"]
+        server = config[f"server.{name}"]
+        return {
+            "url": server["url"].rstrip("/"),
+            "api_key": server["api_key"],
+            "user_id": server["user_id"],
+            "device_id": config.get("device", "id", fallback=str(uuid.uuid4())),
+        }
+    except KeyError:
+        return None
+
+
+class JellyfinReporter:
+    """Post play / progress / stop events so Jellyfin stores resume points.
+
+    Deliberately not a Thread subclass: Thread already owns names like
+    _started (an Event), and shadowing one silently turns a method call into
+    something else entirely.
+    """
+
+    def __init__(self, mpv_client: MpvClient):
+        self.mpv = mpv_client
+        self.item_id: str | None = None
+        self.session_id: str | None = None
+        self.position = 0.0
+        self.paused = False
+        self.last_report = 0.0
+        self._complained = False
+
+    # ---- HTTP ---------------------------------------------------------
+
+    def _post(self, server: dict, path: str, body: dict) -> bool:
+        auth = (f'MediaBrowser Client="jvuey", Device="{socket.gethostname()}", '
+                f'DeviceId="{server["device_id"]}", Version="1.0", '
+                f'Token="{server["api_key"]}"')
+        request = urllib.request.Request(
+            f"{server['url']}{path}",
+            data=json.dumps(body).encode(),
+            method="POST",
+            headers={"Authorization": auth, "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8):
+                pass
+            if self._complained:
+                print("jellyfin: reporting recovered", flush=True)
+                self._complained = False
+            return True
+        except (urllib.error.URLError, OSError) as e:
+            # A server that is down must not take the remote down with it, and
+            # must not fill the journal either - complain once, then go quiet.
+            if not self._complained:
+                print(f"jellyfin: cannot report progress ({e}) - will keep trying",
+                      flush=True)
+                self._complained = True
+            return False
+
+    def _payload(self, **extra) -> dict:
+        body = {
+            "ItemId": self.item_id,
+            "PositionTicks": int(max(0.0, self.position) * TICKS_PER_SECOND),
+            "PlaySessionId": self.session_id,
+            "CanSeek": True,
+            "PlayMethod": "DirectPlay",
+        }
+        body.update(extra)
+        return body
+
+    # ---- transitions --------------------------------------------------
+
+    def _report_start(self, server: dict, item_id: str) -> None:
+        self.item_id = item_id
+        self.session_id = uuid.uuid4().hex
+        self.last_report = time.monotonic()
+        self._post(server, "/Sessions/Playing", self._payload(IsPaused=False))
+        print(f"jellyfin: playing {item_id}", flush=True)
+
+    def _report_progress(self, server: dict) -> None:
+        self.last_report = time.monotonic()
+        self._post(server, "/Sessions/Playing/Progress",
+                   self._payload(IsPaused=self.paused, EventName="timeupdate"))
+
+    def _report_stop(self, server: dict) -> None:
+        if not self.item_id:
+            return
+        seconds = self.position
+        self._post(server, "/Sessions/Playing/Stopped", self._payload())
+        print(f"jellyfin: stopped {self.item_id} at {seconds:.0f}s", flush=True)
+        self.item_id = None
+        self.session_id = None
+        self.position = 0.0
+
+    # ---- loop ---------------------------------------------------------
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, daemon=True,
+                         name="jellyfin-reporter").start()
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(POLL_EVERY)
+            try:
+                self._tick()
+            except Exception as e:                     # never let this thread die
+                print(f"jellyfin: reporter error: {e}", flush=True)
+
+    def _tick(self) -> None:
+        server = _load_server()
+        if server is None:
+            return
+
+        results = self.mpv.batch([["get_property", "path"],
+                                  ["get_property", "time-pos"],
+                                  ["get_property", "pause"]])
+        if results is None:
+            self._report_stop(server)                      # mpv is gone
+            return
+
+        path, position, paused = results
+        match = ITEM_ID_PATTERN.search(path or "")
+        if not match:
+            # Something is playing that did not come from the selector.
+            self._report_stop(server)
+            return
+
+        item_id = match.group(1)
+        was_paused = self.paused
+        self.paused = bool(paused)
+        if position is not None:
+            self.position = float(position)
+
+        if item_id != self.item_id:
+            self._report_stop(server)
+            self._report_start(server, item_id)
+            return
+
+        # Report on a timer, and immediately on a pause change so the server
+        # does not sit showing the wrong state for up to ten seconds.
+        if was_paused != self.paused or time.monotonic() - self.last_report >= REPORT_EVERY:
+            self._report_progress(server)
 
 
 # ============================================================================
@@ -832,9 +1016,16 @@ def main():
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
 
+    if os.environ.get("JVUEY_REPORT", "1") != "0":
+        JellyfinReporter(mpv).start()
+        reporting = "on"
+    else:
+        reporting = "off (JVUEY_REPORT=0)"
+
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.daemon_threads = True
     print(f"jvuey-remote listening on http://0.0.0.0:{port}/remote", flush=True)
+    print(f"  jellyfin progress reporting: {reporting}", flush=True)
     print(f"  tui socket: {TUI_SOCKET}", flush=True)
     print(f"  mpv socket: {MPV_SOCKET}", flush=True)
     try:

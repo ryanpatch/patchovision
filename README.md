@@ -53,6 +53,25 @@ still `exec`s mpv exactly as before, playback is untouched: the only addition
 to the mpv command line is `--input-ipc-server`, which opens a socket and
 changes nothing about decoding, output or timing.
 
+## Progress reporting
+
+The remote also tells Jellyfin where playback got to, so resume points and
+watched state work the way they do in any other client — the web UI and the
+mobile apps will offer to resume a title you stopped halfway, and the
+selector's own partial-watched marker starts appearing.
+
+This lives in `jvuey-remote.py` rather than the selector, because the selector
+`exec`s mpv and is gone for the whole of playback. The daemon is the only
+process alive throughout, and it already polls mpv. The Jellyfin item id comes
+out of mpv's own `path` — the stream URL the selector built — so nothing extra
+has to be plumbed between them.
+
+It posts `Playing` on start, `Progress` every ten seconds and on any pause
+change, and `Stopped` with the final position. A Jellyfin that is down or
+unreachable is logged once and retried, and never affects the remote itself.
+
+Set `JVUEY_REPORT=0` in the service environment to turn it off.
+
 ## Requirements
 
 - Linux with systemd, on a machine whose console you can log into
