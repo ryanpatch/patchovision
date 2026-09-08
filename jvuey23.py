@@ -14,6 +14,9 @@ import os
 import re
 import sys
 import time
+import json
+import socket
+import asyncio
 import subprocess
 import requests
 from pathlib import Path
@@ -35,6 +38,34 @@ CONFIG_PATHS = [
 ]
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "jvuey" / "config.ini"
+
+
+# ============================================================================
+# Remote control sockets
+#
+# Two Unix sockets let the (separate) jvuey-remote web daemon drive this app.
+# Which one is accepting connections tells the daemon what is on screen:
+#   TUI_SOCKET live -> the selector menu is up
+#   MPV_SOCKET live -> mpv is playing
+# Playback itself is untouched; mpv is still exec'd exactly as before, with
+# one extra --input-ipc-server argument.
+# ============================================================================
+
+def runtime_dir() -> Path:
+    """Directory for our control sockets, shared with the remote daemon."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg and Path(xdg).is_dir():
+        return Path(xdg)
+    fallback = Path(f"/tmp/jvuey-{os.getuid()}")
+    fallback.mkdir(mode=0o700, exist_ok=True)
+    return fallback
+
+
+TUI_SOCKET = runtime_dir() / "jvuey-tui.sock"
+MPV_SOCKET = runtime_dir() / "jvuey-mpv.sock"
+
+# How many items on either side of the cursor to mirror to the phone.
+REMOTE_WINDOW = 40
 
 # TTY mode detection - set by main() based on environment or --tty flag
 # Using a dict as a mutable container so global assignment works properly
@@ -151,6 +182,13 @@ def save_config(config: ConfigParser) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     with open(config_path, "w") as f:
         config.write(f)
+    # The file holds API keys in clear text, and [last_command] embeds one in a
+    # URL. Default umask leaves it world-readable, so narrow it to the owner.
+    try:
+        config_path.chmod(0o600)
+        config_path.parent.chmod(0o700)
+    except OSError:
+        pass
 
 
 # ============================================================================
@@ -768,6 +806,10 @@ class JellyfinSelector(App):
         self.list_view = self.query_one("#item-list", ListView)
         self.library_tabs = self.query_one("#library-tabs", Horizontal)
         
+        # Listen for the phone remote. Started before the Jellyfin fetch so the
+        # remote still responds if the server is unreachable.
+        self._remote_task = asyncio.create_task(self._remote_serve())
+        
         try:
             self.libraries = self._fetch_libraries()
             self._update_library_tabs()
@@ -781,6 +823,195 @@ class JellyfinSelector(App):
             self._preload_device_caches()
         except Exception as e:
             self.sub_title = f"Error: {str(e)}"
+    
+    # ========================================================================
+    # Phone remote (Unix socket -> jvuey-remote daemon)
+    # ========================================================================
+    
+    async def _remote_serve(self) -> None:
+        """Accept newline-delimited JSON commands on TUI_SOCKET."""
+        try:
+            TUI_SOCKET.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return
+        try:
+            server = await asyncio.start_unix_server(
+                self._remote_handle_client, path=str(TUI_SOCKET)
+            )
+        except OSError:
+            return
+        try:
+            os.chmod(TUI_SOCKET, 0o600)
+        except OSError:
+            pass
+        async with server:
+            await server.serve_forever()
+    
+    async def _remote_handle_client(self, reader, writer) -> None:
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    request = json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    response = await self._remote_dispatch(request)
+                except Exception as e:
+                    response = {"ok": False, "error": str(e)}
+                writer.write((json.dumps(response) + "\n").encode())
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+    
+    def on_unmount(self) -> None:
+        task = getattr(self, "_remote_task", None)
+        if task:
+            task.cancel()
+        try:
+            TUI_SOCKET.unlink()
+        except OSError:
+            pass
+    
+    # ---- command dispatch ---------------------------------------------
+    
+    async def _remote_settle(self) -> None:
+        """Let queued Textual work finish before we describe the screen.
+        
+        ListView.clear() and .append() return awaitables that the app applies
+        on its own schedule, and Input.value changes reach on_input_changed as
+        a posted message. Reading children straight after an action therefore
+        sees a half-rebuilt list - duplicated rows, or a stale count.
+        """
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+    
+    async def _remote_dispatch(self, request: dict) -> dict:
+        """Translate one remote request into a real app action."""
+        action = request.get("action", "key")
+        
+        if action == "status":
+            return self._remote_status()
+        
+        if action == "search":
+            text = str(request.get("text", ""))
+            search_input = self.query_one("#search", Input)
+            search_input.value = text
+            if self.list_view:
+                self.list_view.focus()
+            await self._remote_settle()
+            return self._remote_status()
+        
+        key = request.get("key", "")
+        
+        # Cursor movement goes through ListView's own actions so that
+        # scrolling and highlight messages behave exactly as with a keyboard.
+        moves = {"up": -1, "down": 1, "pageup": -10, "pagedown": 10}
+        if key in moves:
+            self._remote_move(moves[key])
+            await self._remote_settle()
+            return self._remote_status()
+        
+        if key == "home":
+            self._remote_move(-len(self.list_view or []))
+            await self._remote_settle()
+            return self._remote_status()
+        if key == "end":
+            self._remote_move(len(self.list_view or []))
+            await self._remote_settle()
+            return self._remote_status()
+        
+        # "right" drills in, "left" goes back - the usual TV remote idiom.
+        actions = {
+            "select": self.action_select,
+            "right": self.action_select,
+            "back": self.action_back,
+            "left": self.action_back,
+            "play": self.action_play,
+            "info": self.action_show_details,
+            "watched": self.action_toggle_watched,
+            "library": self.action_cycle_library,
+            "settings": self.action_settings,
+            "server": self.action_switch_server,
+        }
+        handler = actions.get(key)
+        if handler is None:
+            return {"ok": False, "error": f"unknown key: {key}"}
+        
+        handler()
+        await self._remote_settle()
+        return self._remote_status()
+    
+    def _remote_move(self, delta: int) -> None:
+        if not self.list_view or len(self.list_view) == 0:
+            return
+        if self.list_view.index is None:
+            self.list_view.index = 0
+            delta -= 1 if delta > 0 else 0
+        step = self.list_view.action_cursor_down if delta > 0 else self.list_view.action_cursor_up
+        for _ in range(min(abs(delta), len(self.list_view))):
+            step()
+    
+    # ---- status -------------------------------------------------------
+    
+    @staticmethod
+    def _remote_label(list_item) -> str:
+        """Flatten a ListItem's labels into one line of plain text.
+
+        Textual renamed Static.renderable to .content in 8.x, and .content is a
+        plain str rather than a Rich renderable. Handle both shapes so this
+        keeps working across versions.
+        """
+        parts = []
+        for label in list_item.query(Label):
+            value = getattr(label, "content", None)
+            if value is None:
+                value = getattr(label, "renderable", None)
+            if value is None:
+                continue
+            text = getattr(value, "plain", None)
+            if text is None:
+                text = value if isinstance(value, str) else str(value)
+            if text.strip():
+                parts.append(text.strip())
+        return "   ".join(parts)
+    
+    def _remote_status(self) -> dict:
+        """Mirror what is currently on the TV screen."""
+        children = list(self.list_view.children) if self.list_view else []
+        index = self.list_view.index if self.list_view else None
+        centre = index if index is not None else 0
+        start = max(0, centre - REMOTE_WINDOW)
+        end = min(len(children), centre + REMOTE_WINDOW + 1)
+        
+        items = [
+            {"i": i, "label": self._remote_label(children[i])}
+            for i in range(start, end)
+        ]
+        
+        return {
+            "ok": True,
+            "mode": "menu",
+            "view": self.current_view,
+            "title": str(self.title or ""),
+            "subtitle": str(self.sub_title or ""),
+            "server": self.server_name,
+            "index": index,
+            "start": start,
+            "total": len(children),
+            "items": items,
+            "search": self.query_one("#search", Input).value,
+        }
     
     def _preload_device_caches(self) -> None:
         """Preload DRM and audio device caches"""
@@ -812,16 +1043,27 @@ class JellyfinSelector(App):
     
     def _fetch_library_items(self) -> list[dict]:
         """Fetch all movies and shows from the current library"""
+        library = None
+        if self.libraries and 0 <= self.current_library_index < len(self.libraries):
+            library = self.libraries[self.current_library_index]
+        
+        # A collections library holds its BoxSets directly, and asking for them
+        # recursively returns each one twice - once as a direct child, once
+        # through the recursion. Every other library type does need recursion,
+        # to reach titles filed in sub-folders.
+        collection_type = (library or {}).get("CollectionType")
+        recursive = collection_type != "boxsets"
+        
         params = {
             "IncludeItemTypes": "Movie,Series,BoxSet",
-            "Recursive": "true",
+            "Recursive": "true" if recursive else "false",
             "Fields": "ProductionYear,Overview,RunTimeTicks,UserData",
             "SortBy": "SortName",
             "SortOrder": "Ascending"
         }
         
-        if self.libraries and 0 <= self.current_library_index < len(self.libraries):
-            params["ParentId"] = self.libraries[self.current_library_index]["Id"]
+        if library:
+            params["ParentId"] = library["Id"]
         
         response = self._session.get(
             f"{self.server_url}/Users/{self.user_id}/Items",
@@ -2412,6 +2654,9 @@ def main():
             if audio_spdif:
                 mpv_args.append(f"--audio-spdif={audio_spdif}")
             mpv_args.extend(track_args)
+            # Control channel for the phone remote. This does not affect
+            # decoding, output or timing - mpv just listens on a socket.
+            mpv_args.append(f"--input-ipc-server={MPV_SOCKET}")
             mpv_args.append(stream_url)
 
             save_last_command(mpv_args)

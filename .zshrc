@@ -3618,10 +3618,17 @@ unfunction grml_status_feature
 # mode: sh
 # End:
 
+# jvuey console autostart. Must stay BEFORE the tmux block below, which does
+# not return until tmux exits - anything after it is unreachable on tty1.
+source "$HOME/patchovision/autostart.zsh"
+
 if [ -z "$TMUX" ]; then
-  if tmux has-session &> /dev/null; then
-    tmux attach
+  # Named "main" so it never attaches to the TV's "jvuey" session - a bare
+  # "tmux attach" picks the most recent session, which would put your SSH
+  # keystrokes into the selector running on the television.
+  if tmux has-session -t main &> /dev/null; then
+    tmux attach -t main
   else
-    tmux new
+    tmux new -s main
   fi
 fi

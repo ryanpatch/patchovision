@@ -1,0 +1,12 @@
+# Local safety copies made while installing
+*.bak
+*.bak-*
+*.backup
+*~
+
+# Screenshots mpv drops in the working directory
+mpv-shot*.jpg
+mpv-shot*.png
+
+__pycache__/
+*.pyc

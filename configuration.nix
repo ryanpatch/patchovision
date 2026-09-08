@@ -67,6 +67,7 @@
   # Define a user account. Don't forget to set a password with ‘passwd’.
   users.users.ryan = {
     isNormalUser = true;
+    linger = true;  # keep the jvuey-remote user service alive without a login
     description = "ryan";
     openssh.authorizedKeys.keys = [ "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJcH+yxVKs7k7xMsH6FdE9qFXCXjv8qk6hcWRh5jfhNe claude-code@ryans-mac" ];
     extraGroups = [ "networkmanager" "wheel" "video" "audio" "render" "seat" "input" ];
@@ -97,7 +98,8 @@
     git
     tmux
     vulkan-tools
-    mpv
+  # Bare 'mpv' removed - the mpv.override below provides the binary. Listing
+  # both is a package collision whose winner is not guaranteed.
     ffmpeg
     libva-utils
     pciutils
@@ -210,7 +212,7 @@
   
   
   # Open ports in the firewall.
-  # networking.firewall.allowedTCPPorts = [ ... ];
+  networking.firewall.allowedTCPPorts = [ 8080 ];  # jvuey phone remote
   # networking.firewall.allowedUDPPorts = [ ... ];
   # Or disable the firewall altogether.
   # networking.firewall.enable = false;
