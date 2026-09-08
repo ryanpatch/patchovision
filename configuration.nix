@@ -127,29 +127,31 @@
     alsa.enable = true;
     pulse.enable = true;
 
-    # HDMI out to the AV receiver. Intel's DMA position reporting is imprecise,
-    # so give the ALSA sink extra headroom; and stop the node suspending when
-    # idle, since the receiver re-syncs on resume and that is audible.
+    # HDMI out to the AV receiver. Stop the sink node suspending when idle, so
+    # the receiver is not forced to re-acquire the stream on resume.
     wireplumber.extraConfig."52-hdmi-headroom" = {
       "monitor.alsa.rules" = [
         {
           matches = [ { "node.name" = "~alsa_output.*hdmi.*"; } ];
           actions.update-props = {
-            "api.alsa.headroom" = 1024;
+            # No api.alsa.headroom here on purpose: it added ~21ms of output
+            # latency that mpv does not compensate for, and the sink has never
+            # once underrun, so it was buying nothing.
             "session.suspend-timeout-seconds" = 0;
           };
         }
       ];
     };
 
-    # Fewer, fatter wakeups. Latency is irrelevant here; raising min-quantum is
-    # what stops a client dragging the whole graph down to 32 frames.
+    # Keep the graph at PipeWire's default 1024-frame quantum (21ms) - going to
+    # 2048 cost 43ms of lip sync for no measurable benefit. min-quantum is still
+    # raised so a client cannot drag the graph down to 32 frames.
     extraConfig.pipewire."92-htpc-quantum" = {
       "context.properties" = {
         "default.clock.rate" = 48000;
-        "default.clock.quantum" = 2048;
+        "default.clock.quantum" = 1024;
         "default.clock.min-quantum" = 1024;
-        "default.clock.max-quantum" = 4096;
+        "default.clock.max-quantum" = 2048;
       };
     };
   };
