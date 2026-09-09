@@ -1,12 +1,16 @@
 # patchovision
 
-A Jellyfin front-end for a TV-connected Linux box with no desktop: a terminal
+A "pure" Jellyfin front-end for a TV-connected Linux box with no desktop: a terminal
 selector on the console, mpv rendering straight to DRM/KMS, and a phone remote
 you reach in a browser.
 
 There is no compositor, no X, no Wayland. The selector draws in the framebuffer
 and mpv takes the display directly, which is what keeps playback clean on
-modest hardware.
+modest hardware. The idea is to stream the least-modified, purest version of every
+file. It's also to be able to control the tonemapping of HDR content to SDR. Most
+consumer devices won't truly have the capability to produce HDR (especially projectors)
+so this device allows the intentional and elegant tonemapping to happen on the device's
+end, not trusting the TV or projector to do it themselves.
 
 ## The pieces
 
