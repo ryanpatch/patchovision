@@ -18,9 +18,10 @@ modest hardware.
 | `autostart.zsh` | Optional. Starts the selector on the TV console at login. |
 | `install.sh` | Sets up the remote as a user service. |
 
-`configuration.nix`, `hardware-configuration.nix`, `flake.nix` and `.zshrc` are
-the NixOS configuration for the machine this was built on. They are here as a
-working reference, not as something to deploy as-is.
+`configuration.nix`, `hardware-configuration.nix` and `flake.nix` are the NixOS
+configuration for the machine this was built on. They are a working reference —
+not something to deploy as-is, since `hardware-configuration.nix` describes that
+machine's disks. The install below does not touch them.
 
 ## How the remote works
 
@@ -119,6 +120,8 @@ block does not return until tmux exits and anything after it is unreachable:
 source /path/to/patchovision/autostart.zsh
 ```
 
+On NixOS there is a better place for this than `~/.zshrc` — see below.
+
 It only fires on `/dev/tty1` (override with `JVUEY_CONSOLE`), so SSH sessions
 always get an ordinary shell and you cannot lock yourself out. Set
 `touch ~/.jvuey-stop` to disable it, `rm ~/.jvuey-stop` to re-enable.
@@ -135,6 +138,23 @@ networking.firewall.allowedTCPPorts = [ 8080 ];
 users.users.<you>.linger = true;          # instead of loginctl enable-linger
 services.getty.autologinUser = "<you>";   # if you want the TV to boot to the menu
 ```
+
+The console autostart is better placed here than in `~/.zshrc`. `/etc/zshrc` is
+sourced *before* the user's own file, so it cannot be stranded behind a block
+that never returns — which is exactly what a `tmux` launch in `~/.zshrc` does.
+
+```nix
+programs.zsh.enable = true;
+programs.zsh.interactiveShellInit = ''
+  [ -r /home/<you>/patchovision/autostart.zsh ] && \
+    JVUEY_DIR=/home/<you>/patchovision source /home/<you>/patchovision/autostart.zsh
+'';
+```
+
+The `-r` guard is not decoration: a bad path in `/etc/zshrc` would break every
+interactive shell on the machine. `JVUEY_DIR` is set explicitly because the
+script's usual trick of resolving its own directory gives the wrong answer when
+it is sourced from somewhere else.
 
 If you want the remote on port 80 rather than 8080, that is a kernel setting —
 a file in `/etc/sysctl.d/` will not survive a rebuild:
@@ -227,5 +247,6 @@ to mpv, so something has to restart it.
 ./install.sh --uninstall
 ```
 
-Then remove the `source .../autostart.zsh` line from `~/.zshrc` and close the
-firewall port.
+Then remove the autostart — the `source .../autostart.zsh` line from `~/.zshrc`,
+or the `programs.zsh.interactiveShellInit` block from `configuration.nix` on
+NixOS — and close the firewall port.

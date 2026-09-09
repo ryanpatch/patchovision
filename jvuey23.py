@@ -15,7 +15,6 @@ import re
 import sys
 import time
 import json
-import socket
 import asyncio
 import subprocess
 import requests
