@@ -12,7 +12,10 @@
 #
 # Off switch: touch ~/.jvuey-stop     Back on: rm ~/.jvuey-stop
 
-JVUEY_DIR="${0:A:h}"
+# Honour an explicit location (NixOS sources this from /etc/zshrc, where the
+# script's own path is not where the rest of the project lives); otherwise
+# resolve our own directory.
+JVUEY_DIR="${JVUEY_DIR:-${0:A:h}}"
 JVUEY_CONSOLE="${JVUEY_CONSOLE:-/dev/tty1}"
 
 if [ -z "$TMUX" ] && [ "$(tty)" = "$JVUEY_CONSOLE" ] \

@@ -170,6 +170,15 @@
 
 
   programs.zsh.enable = true;
+
+  # Start the jvuey selector on the TV console. This belongs here rather than
+  # in ~/.zshrc: /etc/zshrc is sourced before the user's own file, so it cannot
+  # be stranded behind a block that never returns (a tmux launch, say). The -r
+  # guard matters - a bad path here would break every interactive shell.
+  programs.zsh.interactiveShellInit = ''
+    [ -r /home/ryan/patchovision/autostart.zsh ] && \
+      JVUEY_DIR=/home/ryan/patchovision source /home/ryan/patchovision/autostart.zsh
+  '';
   users.defaultUserShell = pkgs.zsh;
     
   hardware.graphics = {

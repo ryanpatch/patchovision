@@ -1,3 +1,11 @@
+# Personal shell config - the autostart lives in autostart.zsh instead
+.zshrc
+
+# Superseded selector versions. Still in git history if ever needed:
+#   git show <commit>:jvuey22.py
+jvuey20.py
+jvuey22.py
+
 # Local safety copies made while installing
 *.bak
 *.bak-*
