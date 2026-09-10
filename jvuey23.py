@@ -109,6 +109,13 @@ OUTPUT_PROFILES = {
         "target-prim": "bt.2020",
         "target-gamut": "bt.2020",
         "target-peak": "1000",
+        # Without this mpv emits PQ-encoded pixels but never sets the HDMI
+        # HDR metadata, so the display stays in SDR mode and the picture comes
+        # out flat and grey. Passthrough is not passthrough without it.
+        "target-colorspace-hint": "yes",
+        # In passthrough the display does the tone mapping, so mpv's
+        # peak-detect compute pass is work with nowhere to go.
+        "hdr-compute-peak": "no",
     },
 }
 
