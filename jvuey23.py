@@ -88,6 +88,17 @@ def _get_chars() -> dict:
         _CONFIG["chars"] = CHARS_ASCII if _CONFIG["tty_mode"] else CHARS_UNICODE
     return _CONFIG["chars"]
 
+def jellyfin_auth(api_key: str) -> str:
+    """The token as an Authorization header value.
+
+    Jellyfin 10.11 turned the older ways of passing it - an ?api_key= query
+    parameter, or an X-MediaBrowser-Token / X-Emby-Token header - off by
+    default, and a server with them off answers 401 to every request. The
+    standard Authorization header works on old and new servers alike.
+    """
+    return f'MediaBrowser Token="{api_key}"'
+
+
 # ============================================================================
 # Video output
 #
@@ -647,7 +658,7 @@ def quick_connect_auth(server_url: str) -> tuple[str, str] | None:
     device_id = get_device_id()
     
     headers = {
-        "X-Emby-Authorization": f'MediaBrowser Client="jvuey", Device="jvuey-tui", DeviceId="{device_id}", Version="1.0.0"'
+        "Authorization": f'MediaBrowser Client="jvuey", Device="jvuey-tui", DeviceId="{device_id}", Version="1.0.0"'
     }
     
     # Step 1: Check if Quick Connect is available
@@ -873,7 +884,7 @@ class JellyfinSelector(App):
         
         # HTTP session for connection pooling
         self._session = requests.Session()
-        self._session.headers["X-MediaBrowser-Token"] = api_key
+        self._session.headers["Authorization"] = jellyfin_auth(api_key)
         
         # Library state
         self.libraries = []
@@ -2207,9 +2218,10 @@ class JellyfinSelector(App):
     def _play_item(self, item: dict) -> None:
         """Play a movie or episode"""
         item_id = item["Id"]
-        stream_url = f"{self.server_url}/Items/{item_id}/Download?api_key={self.api_key}"
+        stream_url = f"{self.server_url}/Items/{item_id}/Download"
         self._begin_playback(item, {
             "url": stream_url,
+            "auth": jellyfin_auth(self.api_key),
             "drm_connector": self.drm_connector,
             "drm_mode": self.drm_mode,
             "audio_device": self.audio_device,
@@ -2301,7 +2313,7 @@ class JellyfinSelector(App):
             return
         
         item_id = self.detail_item["Id"]
-        stream_url = f"{self.server_url}/Items/{item_id}/Download?api_key={self.api_key}"
+        stream_url = f"{self.server_url}/Items/{item_id}/Download"
         
         # Use temporary settings if set, otherwise fall back to defaults
         drm_connector = self.detail_drm_connector if self.detail_drm_connector is not None else self.drm_connector
@@ -2320,6 +2332,7 @@ class JellyfinSelector(App):
         
         self._begin_playback(self.detail_item, {
             "url": stream_url,
+            "auth": jellyfin_auth(self.api_key),
             "drm_connector": drm_connector,
             "drm_mode": drm_mode,
             "audio_device": audio_device,
@@ -3025,6 +3038,9 @@ def main():
                 mpv_args.append(f"--audio-spdif={audio_spdif}")
             if start_at:
                 mpv_args.append(f"--start={int(start_at)}")
+            if result.get("auth"):
+                mpv_args.append(
+                    f"--http-header-fields-append=Authorization: {result['auth']}")
             mpv_args.extend(track_args)
             # Video output (SDR / HDR and the SDR tone-mapping knobs). Read
             # fresh from the config so a change in the settings screen applies
